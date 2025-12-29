@@ -152,12 +152,18 @@ impl Drive {
             .output()
             .map_err(anyhow::Error::from)?;
         if !output.status.success() {
-            match output.status.code() {
-                Some(ENOENT) => return Err(StateError::DeviceMissing),
-                _ => {
-                    return Err(anyhow::anyhow!("hdparm failed with code {}", output.status).into());
-                }
+            // Check stderr for device missing indicators
+            let stderr = std::str::from_utf8(&output.stderr).unwrap_or("");
+            // Exit code 2 (ENOENT) = file doesn't exist
+            // Exit code 5 = I/O error, typically means device is being detached or unreachable
+            if stderr.contains("No such device")
+                || stderr.contains("No such file or directory")
+                || output.status.code() == Some(ENOENT)
+                || output.status.code() == Some(5)
+            {
+                return Err(StateError::DeviceMissing);
             }
+            return Err(anyhow::anyhow!("hdparm failed with code {}", output.status).into());
         }
         let lines: Vec<_> = output
             .stdout
@@ -195,17 +201,22 @@ impl Drive {
                     .ok_or_else(|| anyhow::anyhow!("Invalid device path"))?,
             ])
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
             .env("LANG", "C")
             .output()
             .map_err(anyhow::Error::from)?;
         if !output.status.success() {
-            match output.status.code() {
-                Some(SDPARM_DEVICE_MISSING_CODE) => return Err(StateError::DeviceMissing),
-                _ => {
-                    return Err(anyhow::anyhow!("sdparm failed with code {}", output.status).into());
-                }
+            // Check stderr for device missing indicators
+            let stderr = std::str::from_utf8(&output.stderr).unwrap_or("");
+            // SDPARM_DEVICE_MISSING_CODE = 50 + ENOENT (52)
+            // Exit code 5 = I/O error, typically means device is being detached or unreachable
+            if stderr.contains("No such device")
+                || stderr.contains("No such file or directory")
+                || output.status.code() == Some(SDPARM_DEVICE_MISSING_CODE)
+                || output.status.code() == Some(5)
+            {
+                return Err(StateError::DeviceMissing);
             }
+            return Err(anyhow::anyhow!("sdparm failed with code {}", output.status).into());
         }
         let state = output
             .stdout
@@ -227,6 +238,16 @@ impl Drive {
 
     /// Get drive runtime state
     pub(crate) fn state(&self) -> Result<State, StateError> {
+        // Check if the device actually exists (the symlink might be stale)
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(metadata) = self.dev_path.metadata() {
+            if !metadata.file_type().is_block_device() {
+                return Err(StateError::DeviceMissing);
+            }
+        } else {
+            return Err(StateError::DeviceMissing);
+        }
+
         const SUSPENDED_PM_STATUS: [&str; 2] = ["suspended", "suspending"];
         let pm_status_path: PathBuf = [
             OsStr::new("/sys/class/block"),

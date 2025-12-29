@@ -6,6 +6,7 @@
 )]
 
 use std::{
+    collections::HashMap,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -105,7 +106,8 @@ fn main() -> anyhow::Result<()> {
                 start: drive_temp_range[0],
                 end: drive_temp_range[1],
             };
-            let drive_paths: Vec<PathBuf> = drive_selectors
+            // All configured drive paths (may include non-existent drives)
+            let all_drive_paths: Vec<PathBuf> = drive_selectors
                 .into_iter()
                 .map(|s| {
                     s.to_drive_paths()
@@ -115,24 +117,41 @@ fn main() -> anyhow::Result<()> {
                 .into_iter()
                 .flatten()
                 .collect();
-            anyhow::ensure!(!drive_paths.is_empty(), "No drive match");
-            let drives: Vec<Drive> = drive_paths
-                .iter()
-                .map(|path| Drive::new(path))
-                .collect::<anyhow::Result<_>>()
-                .context("Failed to setup drives")?;
-            let mut drive_probers: Vec<(Box<dyn DeviceTempProber>, bool)> = drives
-                .iter()
-                .zip(drive_paths.iter())
-                .map(|(drive, path)| {
-                    probe::prober(drive, hddtemp_daemon_port)
-                        .with_context(|| format!("Failed to setup prober for drive {drive}"))?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("No probing method found for drive {path:?}")
-                        })
-                })
-                .collect::<anyhow::Result<_>>()
-                .context("Failed to setup drive probers")?;
+
+            // Initialize drives that exist at startup
+            let mut drive_map: HashMap<PathBuf, (Drive, Box<dyn DeviceTempProber>, bool)> =
+                HashMap::new();
+            // Track which drives were accessible in the previous cycle (for removal detection)
+            let mut previously_accessible: HashMap<PathBuf, String> = HashMap::new();
+
+            for path in &all_drive_paths {
+                if !path.exists() {
+                    if allow_missing_devices {
+                        log::debug!("Drive {path:?} not present at startup, will be skipped");
+                    } else {
+                        anyhow::bail!("Drive {path:?} does not exist");
+                    }
+                    continue;
+                }
+
+                let drive = Drive::new(path)
+                    .with_context(|| format!("Failed to setup drive {path:?}"))?;
+                let (prober, supports_probing_sleeping) = probe::prober(&drive, hddtemp_daemon_port)
+                    .with_context(|| format!("Failed to setup prober for drive {drive}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("No probing method found for drive {path:?}")
+                    })?;
+                log::info!("Monitoring drive: {drive}");
+                drive_map.insert(path.clone(), (drive, prober, supports_probing_sleeping));
+            }
+
+            if drive_map.is_empty() {
+                if allow_missing_devices {
+                    log::warn!("No drives present at startup, will run with minimum fan speed");
+                } else {
+                    anyhow::bail!("No drive match");
+                }
+            }
 
             let mut hwmon_and_range: Vec<(Hwmon, Range<Temp>)> = hwmons
                 .iter()
@@ -191,10 +210,47 @@ fn main() -> anyhow::Result<()> {
             while !exit_requested.load(Ordering::SeqCst) {
                 let start = Instant::now();
 
-                let max_drive_temp = drive_probers
+                // Check for newly connected drives (only when allow_missing_devices is enabled)
+                if allow_missing_devices {
+                    for path in &all_drive_paths {
+                        if path.exists() && !drive_map.contains_key(path) {
+                            // New drive appeared - initialize it
+                            match (|| -> anyhow::Result<_> {
+                                let drive = Drive::new(path)
+                                    .with_context(|| format!("Failed to setup drive {path:?}"))?;
+                                let (prober, supports_probing_sleeping) =
+                                    probe::prober(&drive, hddtemp_daemon_port)
+                                        .with_context(|| {
+                                            format!("Failed to setup prober for drive {drive}")
+                                        })?
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "No probing method found for drive {path:?}"
+                                            )
+                                        })?;
+                                Ok((drive, prober, supports_probing_sleeping))
+                            })() {
+                                Ok((drive, prober, supports_probing_sleeping)) => {
+                                    log::info!("Detected drive connection: {drive}");
+                                    drive_map.insert(
+                                        path.clone(),
+                                        (drive, prober, supports_probing_sleeping),
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to initialize newly detected drive {path:?}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Track currently accessible drives for removal detection
+                let mut currently_accessible: HashMap<PathBuf, String> = HashMap::new();
+
+                let max_drive_temp = drive_map
                     .iter_mut()
-                    .zip(drives.iter())
-                    .map(|((prober, supports_probing_sleeping), drive)| {
+                    .map(|(path, (drive, prober, supports_probing_sleeping))| {
                         let state = match drive.state() {
                             Ok(state) => state,
                             Err(StateError::DeviceMissing) if allow_missing_devices => {
@@ -231,6 +287,8 @@ fn main() -> anyhow::Result<()> {
                             log::debug!("Drive {drive} in state {state} can not be probed");
                             None
                         };
+                        // Mark this drive as accessible in this cycle
+                        currently_accessible.insert(path.clone(), drive.to_string());
                         Ok(temp)
                     })
                     .collect::<anyhow::Result<Vec<_>>>()
@@ -238,6 +296,18 @@ fn main() -> anyhow::Result<()> {
                     .into_iter()
                     .flatten()
                     .reduce(f64::max);
+
+                // Detect drive removals (drives that were accessible before but not now)
+                if allow_missing_devices {
+                    for (path, drive_name) in &previously_accessible {
+                        if !currently_accessible.contains_key(path) {
+                            log::info!("Detected drive removal: {drive_name}");
+                            // Remove from drive_map so it gets reinitialized if reconnected
+                            drive_map.remove(path);
+                        }
+                    }
+                    previously_accessible = currently_accessible;
+                }
 
                 let hwmon_temps: Vec<Temp> = hwmon_and_range
                     .iter_mut()
